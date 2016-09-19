@@ -58,6 +58,8 @@ typedef struct _GstAppSinkPrivate GstAppSinkPrivate;
  *       The new sample can be retrieved with
  *       gst_app_sink_pull_sample() either from this callback
  *       or from any other thread.
+ * @seek_data: Called when a downstream seek is performed
+ *       This callback is called from the steaming thread.
  *
  * A set of callbacks that can be installed on the appsink with
  * gst_app_sink_set_callbacks().
@@ -66,6 +68,7 @@ typedef struct {
   void          (*eos)              (GstAppSink *appsink, gpointer user_data);
   GstFlowReturn (*new_preroll)      (GstAppSink *appsink, gpointer user_data);
   GstFlowReturn (*new_sample)       (GstAppSink *appsink, gpointer user_data);
+  gboolean      (*seek_data)        (GstAppSink *appsink, guint64 offset, gpointer user_data);
 
   /*< private >*/
   gpointer     _gst_reserved[GST_PADDING];
@@ -90,6 +93,7 @@ struct _GstAppSinkClass
   void          (*eos)              (GstAppSink *appsink);
   GstFlowReturn (*new_preroll)      (GstAppSink *appsink);
   GstFlowReturn (*new_sample)       (GstAppSink *appsink);
+  gboolean      (*seek_data)        (GstAppSink *appsink, guint64 offset);
 
   /* actions */
   GstSample *   (*pull_preroll)      (GstAppSink *appsink);

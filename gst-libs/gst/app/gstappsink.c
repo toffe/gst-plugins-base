@@ -77,6 +77,7 @@ struct _GstAppSinkPrivate
 {
   GstCaps *caps;
   gboolean emit_signals;
+  gboolean seekable;
   guint num_buffers;
   guint max_buffers;
   gboolean drop;
@@ -109,6 +110,7 @@ enum
   SIGNAL_EOS,
   SIGNAL_NEW_PREROLL,
   SIGNAL_NEW_SAMPLE,
+  SIGNAL_SEEK_DATA,
 
   /* actions */
   SIGNAL_PULL_PREROLL,
@@ -121,6 +123,7 @@ enum
 
 #define DEFAULT_PROP_EOS		TRUE
 #define DEFAULT_PROP_EMIT_SIGNALS	FALSE
+#define DEFAULT_PROP_SEEKABLE		FALSE
 #define DEFAULT_PROP_MAX_BUFFERS	0
 #define DEFAULT_PROP_DROP		FALSE
 #define DEFAULT_PROP_WAIT_ON_EOS	TRUE
@@ -131,6 +134,7 @@ enum
   PROP_CAPS,
   PROP_EOS,
   PROP_EMIT_SIGNALS,
+  PROP_SEEKABLE,
   PROP_MAX_BUFFERS,
   PROP_DROP,
   PROP_WAIT_ON_EOS,
@@ -203,6 +207,12 @@ gst_app_sink_class_init (GstAppSinkClass * klass)
       g_param_spec_boolean ("emit-signals", "Emit signals",
           "Emit new-preroll and new-sample signals",
           DEFAULT_PROP_EMIT_SIGNALS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_SEEKABLE,
+      g_param_spec_boolean ("seekable", "Seekable",
+          "Make appsink seekable.",
+          DEFAULT_PROP_SEEKABLE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property (gobject_class, PROP_MAX_BUFFERS,
@@ -283,6 +293,21 @@ gst_app_sink_class_init (GstAppSinkClass * klass)
       g_signal_new ("new-sample", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
       G_STRUCT_OFFSET (GstAppSinkClass, new_sample),
       NULL, NULL, NULL, GST_TYPE_FLOW_RETURN, 0, G_TYPE_NONE);
+
+  /**
+   * GstAppSink::seek-data:
+   * @appsink: the appsink element that emitted the signal
+   * @offset: the offset to seek to
+   *
+   * Seek to the given offset.
+   *
+   * Returns: %TRUE if the seek succeeded.
+   */
+  gst_app_sink_signals[SIGNAL_SEEK_DATA] =
+      g_signal_new ("seek-data", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
+                    G_STRUCT_OFFSET (GstAppSinkClass, seek_data),
+                    NULL, NULL, __gst_app_marshal_BOOLEAN__UINT64, G_TYPE_BOOLEAN, 1,
+                    G_TYPE_UINT64);
 
   /**
    * GstAppSink::pull-preroll:
@@ -439,6 +464,7 @@ gst_app_sink_init (GstAppSink * appsink)
   priv->queue = g_queue_new ();
 
   priv->emit_signals = DEFAULT_PROP_EMIT_SIGNALS;
+  priv->seekable = DEFAULT_PROP_SEEKABLE;
   priv->max_buffers = DEFAULT_PROP_MAX_BUFFERS;
   priv->drop = DEFAULT_PROP_DROP;
   priv->wait_on_eos = DEFAULT_PROP_WAIT_ON_EOS;
@@ -501,6 +527,9 @@ gst_app_sink_set_property (GObject * object, guint prop_id,
     case PROP_EMIT_SIGNALS:
       gst_app_sink_set_emit_signals (appsink, g_value_get_boolean (value));
       break;
+  case PROP_SEEKABLE:
+      gst_app_sink_set_seekable (appsink, g_value_get_boolean (value));
+      break;
     case PROP_MAX_BUFFERS:
       gst_app_sink_set_max_buffers (appsink, g_value_get_uint (value));
       break;
@@ -538,6 +567,9 @@ gst_app_sink_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_EMIT_SIGNALS:
       g_value_set_boolean (value, gst_app_sink_get_emit_signals (appsink));
+      break;
+  case PROP_SEEKABLE:
+      g_value_set_boolean (value, gst_app_sink_get_seekable (appsink));
       break;
     case PROP_MAX_BUFFERS:
       g_value_set_uint (value, gst_app_sink_get_max_buffers (appsink));
@@ -660,14 +692,37 @@ gst_app_sink_event (GstBaseSink * sink, GstEvent * event)
   GstAppSinkPrivate *priv = appsink->priv;
 
   switch (event->type) {
-    case GST_EVENT_SEGMENT:
+    case GST_EVENT_SEGMENT: {
+      GstSegment *segment;
+      guint64 offset;
+      gboolean res = FALSE;
+
       g_mutex_lock (&priv->mutex);
       GST_DEBUG_OBJECT (appsink, "receiving SEGMENT");
       g_queue_push_tail (priv->queue, gst_event_ref (event));
       if (!priv->preroll)
         gst_event_copy_segment (event, &priv->preroll_segment);
       g_mutex_unlock (&priv->mutex);
+
+      gst_event_parse_segment (event, &segment);
+      offset = (guint64)segment->start;
+
+      if (segment->format == GST_FORMAT_BYTES && priv->seekable) {
+        /* emit seek now */
+        if (priv->callbacks.seek_data) {
+          GST_DEBUG_OBJECT (appsink, "calling seek_data: %llu", offset);
+          res = priv->callbacks.seek_data(appsink, offset, priv->user_data);
+        }
+        else {
+          GST_DEBUG_OBJECT (appsink, "emitting seek_data: %llu", offset);
+          g_signal_emit (appsink, gst_app_sink_signals[SIGNAL_SEEK_DATA], 0, offset, &res);
+        }
+      }
+      if (!res)
+        GST_DEBUG_OBJECT(appsink, "seek failed.");
+
       break;
+    }
     case GST_EVENT_EOS:{
       gboolean emit = TRUE;
 
@@ -904,18 +959,22 @@ static gboolean
 gst_app_sink_query (GstBaseSink * bsink, GstQuery * query)
 {
   gboolean ret;
+  GstAppSink *appsink = GST_APP_SINK_CAST (bsink);
+  GstAppSinkPrivate *priv = appsink->priv;
 
   switch (GST_QUERY_TYPE (query)) {
-    case GST_QUERY_SEEKING:{
-      GstFormat fmt;
-
-      /* we don't supporting seeking */
-      gst_query_parse_seeking (query, &fmt, NULL, NULL, NULL);
-      gst_query_set_seeking (query, fmt, FALSE, 0, -1);
+    case GST_QUERY_SEEKING: {
+      GstFormat format;
+      gst_query_parse_seeking (query, &format, NULL, NULL, NULL);
+      if (format == GST_FORMAT_BYTES && priv->seekable) {
+        GST_DEBUG_OBJECT (appsink, "Got SEEKING query and we're seekable");
+        gst_query_set_seeking (query, GST_FORMAT_BYTES, TRUE, 0, -1);
+      } else {
+        gst_query_set_seeking (query, format, FALSE, 0, -1);
+      }
       ret = TRUE;
       break;
     }
-
     default:
       ret = GST_BASE_SINK_CLASS (parent_class)->query (bsink, query);
       break;
@@ -1075,6 +1134,53 @@ gst_app_sink_get_emit_signals (GstAppSink * appsink)
 
   g_mutex_lock (&priv->mutex);
   result = priv->emit_signals;
+  g_mutex_unlock (&priv->mutex);
+
+  return result;
+}
+
+/**
+ * gst_app_sink_set_seekable:
+ * @appsink: a #GstAppSink
+ * @seekable: the new state
+ *
+ * Make the appsink seekable. This option is by default disabled
+ */
+void
+gst_app_sink_set_seekable (GstAppSink * appsink, gboolean seekable)
+{
+  GstAppSinkPrivate *priv;
+
+  g_return_if_fail (GST_IS_APP_SINK (appsink));
+
+  priv = appsink->priv;
+
+  g_mutex_lock (&priv->mutex);
+  priv->seekable = seekable;
+  g_mutex_unlock (&priv->mutex);
+}
+
+/**
+ * gst_app_sink_get_seekable:
+ * @appsink: a #GstAppSink
+ *
+ * Check if appsink is seekable
+ *
+ * Returns: %TRUE if @appsink is seekable
+ * signals.
+ */
+gboolean
+gst_app_sink_get_seekable (GstAppSink * appsink)
+{
+  gboolean result;
+  GstAppSinkPrivate *priv;
+
+  g_return_val_if_fail (GST_IS_APP_SINK (appsink), FALSE);
+
+  priv = appsink->priv;
+
+  g_mutex_lock (&priv->mutex);
+  result = priv->seekable;
   g_mutex_unlock (&priv->mutex);
 
   return result;
